@@ -1,8 +1,3 @@
-// Sal AI Voice Server v1.0
-// Real-time conversational AI: Twilio + ElevenLabs + Claude
-// All secrets via environment variables — see README
-// Deploy as new Render Web Service (Node, start: node voice_server.js)
-
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -21,95 +16,95 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.get('/', (req, res) => res.json({ status: 'Sal AI Voice Server running' }));
-app.get('/health', (req, res) => res.json({ ok: true }));
 
+app.get('/', (req, res) => res.json({ status: 'Sal AI Voice Server running', version: '2.0.0' }));
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Twilio webhook for inbound calls - returns TwiML with <Say> greeting + <Gather> for keypress
+// This works for BOTH inbound and outbound calls
 app.post('/voice/answer', (req, res) => {
-  const biz = req.query.biz || 'your business';
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || req.headers.host;
+  const biz = req.query.biz || req.body.To || 'your business';
+  const bizClean = decodeURIComponent(biz).replace(/[<>&"']/g, '');
+  const callSid = req.body.CallSid || '';
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || 'sal-ai-voice-server.onrender.com';
+  
+  console.log('[inbound] callSid:', callSid, 'biz:', bizClean, 'host:', host);
+
   res.set('Content-Type', 'text/xml');
-  res.send('<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://' + host + '/voice/stream?biz=' + encodeURIComponent(biz) + '" /></Connect></Response>');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Matthew-Neural" language="en-US">
+    Hi there, this is Sal from Sal AI. We help local businesses with automated follow-ups, review management, and customer reactivation. You can learn more at deal daily dot com. If you would like a free 15 minute walkthrough, press 1 now and someone will call you back personally. To be removed from our list, press 2. Or simply hang up, no problem at all. Thank you for your time.
+  </Say>
+  <Gather numDigits="1" action="https://${host}/voice/keypress" method="POST" timeout="8">
+  </Gather>
+  <Say voice="Polly.Matthew-Neural">Have a great day!</Say>
+</Response>`);
 });
 
-wss.on('connection', async (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  const biz = decodeURIComponent(url.searchParams.get('biz') || 'your business');
-  let streamSid = null, history = [], buf = Buffer.alloc(0);
-  let speaking = false, timer = null, greeted = false;
+// Handle keypress responses
+app.post('/voice/keypress', (req, res) => {
+  const digit = req.body.Digits || '';
+  const from = req.body.From || '';
+  const callSid = req.body.CallSid || '';
+  
+  console.log('[keypress] digit:', digit, 'from:', from);
 
-  const sys = 'You are Sal from Sal AI calling ' + biz + '. Max 2-3 sentences per response. Sal AI: automated follow-ups, review management, customer reactivation. Goal: free 15-min demo. Natural speech. dealdily.com';
-
-  async function tts(text) {
-    if (!EL_KEY) return null;
-    const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + EL_VOICE + '/stream', {
-      method: 'POST', headers: { 'xi-api-key': EL_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-      body: JSON.stringify({ text, model_id: 'eleven_turbo_v2', voice_settings: { stability: 0.5, similarity_boost: 0.8 } })
-    }).catch(() => null);
-    if (!r || !r.ok) return null;
-    return Buffer.from(await r.arrayBuffer());
-  }
-
-  async function claude(text) {
-    if (!CLAUDE_KEY) return "Please visit dealdily.com to learn more.";
-    history.push({ role: 'user', content: text });
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', headers: { 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 100, system: sys, messages: history })
-    }).catch(() => null);
-    if (!r) return "Could you repeat that?";
-    const d = await r.json();
-    const reply = d.content?.[0]?.text || "Could you say that again?";
-    history.push({ role: 'assistant', content: reply });
-    return reply;
-  }
-
-  function sendAudio(a) {
-    if (ws.readyState === WebSocket.OPEN && streamSid)
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: a.toString('base64') } }));
-  }
-
-  async function greet() {
-    if (greeted) return; greeted = true;
-    const msg = 'Hi there, this is Sal from Sal AI. Is this the owner or manager of ' + biz + '?';
-    history.push({ role: 'assistant', content: msg });
-    const a = await tts(msg); if (a) sendAudio(a);
-  }
-
-  async function hotAlert() {
-    if (!TG_BOT || !TG_CHAT) return;
-    await fetch('https://api.telegram.org/bot' + TG_BOT + '/sendMessage', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: '🔥 HOT LEAD on AI Voice Call!\nBusiness: ' + biz + '\n\nCall them back NOW!' })
+  // Alert Saleh on Telegram for press 1
+  if (digit === '1' && TG_BOT && TG_CHAT) {
+    fetch(`https://api.telegram.org/bot${TG_BOT}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT,
+        text: `🔥 HOT LEAD pressed 1!\n\nPhone: ${from}\nCall SID: ${callSid}\n\nCALL THEM BACK NOW — they want a demo!`
+      })
     }).catch(() => {});
   }
 
-  ws.on('message', async (data) => {
-    const msg = JSON.parse(data.toString());
-    if (msg.event === 'start') { streamSid = msg.start.streamSid; setTimeout(greet, 800); }
-    else if (msg.event === 'media') {
-      buf = Buffer.concat([buf, Buffer.from(msg.media.payload, 'base64')]);
-      clearTimeout(timer);
-      timer = setTimeout(async () => {
-        if (buf.length < 400 || speaking) { buf = Buffer.alloc(0); return; }
-        const cap = buf; buf = Buffer.alloc(0); speaking = true;
-        try {
-          const DG = process.env.DEEPGRAM_API_KEY;
-          let text = '';
-          if (DG) {
-            const tr = await fetch('https://api.deepgram.com/v1/listen?model=nova-2', {
-              method: 'POST', headers: { 'Authorization': 'Token ' + DG, 'Content-Type': 'audio/mulaw;rate=8000' }, body: cap
-            }).catch(() => null);
-            if (tr) { const td = await tr.json(); text = td.results?.channels?.[0]?.alternatives?.[0]?.transcript || ''; }
-          }
-          if (!text || text.length < 3) return;
-          if (/yes|interested|sure|demo|tell me/.test(text.toLowerCase())) hotAlert();
-          const reply = await claude(text);
-          const a = await tts(reply); if (a) sendAudio(a);
-        } finally { speaking = false; }
-      }, 700);
-    }
-  });
-  ws.on('close', () => clearTimeout(timer));
+  // Mark as opted out for press 2
+  if (digit === '2' && SB_KEY) {
+    const digits = from.replace(/\D/g,'').slice(-10);
+    fetch(`${SB_URL}/rest/v1/saleh2_leads?phone=like.*${digits}*`, {
+      method: 'PATCH',
+      headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'opted_out', call_outcome: 'opted_out' })
+    }).catch(() => {});
+  }
+
+  res.set('Content-Type', 'text/xml');
+  if (digit === '1') {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Matthew-Neural">Perfect! Someone from Sal AI will call you back personally within 15 minutes. Thank you and have a great day!</Say></Response>`);
+  } else {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Matthew-Neural">You have been removed from our list. We apologize for the interruption. Have a wonderful day!</Say></Response>`);
+  }
 });
 
-server.listen(process.env.PORT || 3001, () => console.log('Sal AI Voice on port', process.env.PORT || 3001));
+// Handle call status callbacks
+app.post('/call-status', (req, res) => {
+  const status = req.body.CallStatus || '';
+  const to = req.body.To || '';
+  const duration = req.body.CallDuration || '0';
+  const callSid = req.body.CallSid || '';
+  console.log('[call-status]', callSid, status, to, duration + 's');
+
+  // Update lead in Supabase
+  if (SB_KEY && to) {
+    const digits = to.replace(/\D/g,'').slice(-10);
+    const outcomes = { completed: 'answered', 'no-answer': 'no_answer', busy: 'busy', failed: 'failed' };
+    const outcome = outcomes[status] || status;
+    fetch(`${SB_URL}/rest/v1/saleh2_leads?phone=like.*${digits}*`, {
+      method: 'PATCH',
+      headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ call_outcome: outcome, call_notes: 'Duration: ' + duration + 's | SID: ' + callSid })
+    }).catch(() => {});
+  }
+  res.sendStatus(200);
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log('[startup] Sal AI Voice Server v2.0 on port', PORT);
+  if (!EL_KEY) console.warn('[startup] WARNING: ELEVENLABS_API_KEY not set');
+  if (!CLAUDE_KEY) console.warn('[startup] WARNING: ANTHROPIC_API_KEY not set');
+});
